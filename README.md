@@ -74,9 +74,6 @@ Why these:
 | `--patch-rpc` | **hangs `-f` spawn** unless you also patch the host `frida/core.py` to the same tag (see the ⚠️ note under *Patch tiers*). |
 | `--aggressive` | rewrites bare `frida` → breaks `frida.Error.*` and the Frida JS global your scripts call. |
 
-> `--patch-agent-symbol` was **removed** — renaming the agent's exported symbol
-> can't be done by binary patching (needs a source rebuild). See the note under
-> *Patch tiers*.
 
 If a target still detects Frida after this, it's using a **runtime/behavioural**
 check (anon exec pages, D-Bus port-sweep, ptrace, inline-hook/CRC) — those need a
