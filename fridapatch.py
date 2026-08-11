@@ -65,9 +65,13 @@ DETECTIONS = [
          note="Not a string. Hook the maps read, or minimise hook count."),
     dict(id="thread-name-scan", fix="binary",
          what="/proc/self/task/*/comm == gmain / gdbus / gum-js-loop / "
-              "pool-frida / pool-spawner",
-         how="glib and gum name their worker threads via pthread_setname_np",
-         note="Fixed: gmain/gdbus/gum-js-loop/pool-spawner literals are rewritten, "
+              "pool-frida / pool-spawner / frida-main-loop / frida-eternal-agent "
+              "(comm 'frida-eternal-a') / frida-generate-certificate "
+              "(comm 'frida-generate-')",
+         how="glib and gum name their worker threads via pthread_setname_np; long "
+             "names are truncated to 15 chars in comm but still start with 'frida'",
+         note="Fixed: gmain/gdbus/gum-js-loop/pool-spawner plus the frida-main-loop/"
+              "frida-eternal-agent/frida-generate-certificate names are rewritten, "
               "and the bare 'frida' prgname that GLib formats into 'pool-%s' is "
               "renamed too, so the pool-frida worker no longer appears."),
     dict(id="process-scan", fix="binary",
@@ -84,13 +88,14 @@ DETECTIONS = [
               "GumScript and the JS sourcemap paths need --patch-signatures. "
               "frida:rpc needs --patch-rpc (it breaks rpc.exports)."),
     dict(id="module-export-scan", fix="runtime",
-         what="dl_iterate_phdr + walk .dynsym of each module for frida_agent_main "
-              "or gum_* exports",
+         what="dl_iterate_phdr + walk .dynsym / DT_SONAME of each module for "
+              "frida_agent_main, gum_* exports, or the libfrida-agent-raw.so soname",
          how="manual ELF parse of loaded objects; survives a filename rename",
-         note="Binary patching cannot help: renaming the agent's EXPORTED symbol "
-              "means rebuilding its GNU hash table, which only a source rebuild "
-              "does (strongR-frida-server). Otherwise hook the app's "
-              "dl_iterate_phdr / dlopen enumeration at runtime."),
+         note="Binary patching cannot help: the exported symbol AND the DT_SONAME "
+              "(libfrida-agent-raw.so) live in the agent's protected dynamic tables "
+              "- renaming them means rebuilding its GNU hash, which only a source "
+              "rebuild does (strongR-frida-server / phantom-frida). Otherwise hook "
+              "the app's dl_iterate_phdr / dlopen enumeration at runtime."),
     dict(id="file-artifact-scan", fix="binary",
          what="access()/stat() on /data/local/tmp/frida-server, "
               "/data/local/tmp/re.frida.server, .../frida-agent-64.so",
@@ -110,6 +115,38 @@ DETECTIONS = [
          how="looks for the b/ldr x16;br x16 trampoline Interceptor writes",
          note="Hook the verifier itself, or replace Interceptor hooks with "
               "Stalker / breakpoint-free strategies."),
+    dict(id="code-integrity-crc", fix="runtime",
+         what="checksum a native lib / libc .text on disk and compare with the "
+              "same range mapped in memory; any inline hook diverges",
+         how="reads the file + /proc/self/mem (or the mapped copy) and memcmp's; "
+              "a superset of inline-hook-check that catches hooks anywhere in .text",
+         note="Not a string. Same mitigation as inline-hook-check: hook the "
+              "verifier, or use Stalker / non-patching hook strategies so .text "
+              "stays byte-identical to disk."),
+    dict(id="exec-page-perms", fix="runtime",
+         what="/proc/self/maps shows a NAMED native lib's .text as rwxp "
+              "(writable+executable)",
+         how="Interceptor mprotect's the target page rw- to write its trampoline; "
+             "a stock lib .text is r-xp, so rwxp on a named module is a tell",
+         note="Distinct from anon-exec-mappings (which counts ANONYMOUS exec "
+              "pages). Not a string - hook the maps read, or restore page perms "
+              "to r-xp after installing the hook."),
+    dict(id="named-pipe-fd-scan", fix="runtime",
+         what="/proc/self/fd symlinks resolve to frida agent<->server pipes or "
+              "the injector's abstract unix socket",
+         how="readlink() every /proc/self/fd/* looking for pipe:/socket targets "
+             "tied to the injection channel",
+         note="The abstract-socket name is de-fingerprinted via linjector (see "
+              "unix-socket-scan), but anonymous pipe:[inode] fds carry no name - "
+              "that part is runtime-only: hook readdir/readlink on /proc/self/fd."),
+    dict(id="timing-hook-check", fix="runtime",
+         what="measure wall-clock latency of a hooked function or a syscall and "
+              "compare against a known-fast baseline",
+         how="Interceptor trampolines and especially Stalker add measurable "
+             "overhead; a function that suddenly takes N times longer implies a hook",
+         note="Not a string. Minimise hook count, avoid Stalker on hot paths, or "
+              "hook the clock source (clock_gettime / System.nanoTime) the check "
+              "reads so the delta disappears."),
     dict(id="java-layer-gates", fix="runtime",
          what="RootBeer, jail-monkey, DexGuard, SafetyNet/Play Integrity",
          how="Java-side checks that gate the app before any native probe",
@@ -145,6 +182,9 @@ PATTERNS = [
     (b"libfrida", "safe", False, "in-memory marker string (lowercase variant)"),
     (b"gmain", "safe", False, "glib main-loop thread name"),
     (b"gdbus", "safe", False, "glib dbus thread name"),
+    (b"frida-main-loop", "safe", False, "thread/GSource name (main loop)"),
+    (b"frida-eternal-agent", "safe", False, "thread name (eternal agent) -> comm 'frida-eternal-a'"),
+    (b"frida-generate-certificate", "safe", False, "thread name (TLS cert-gen) -> comm 'frida-generate-'"),
     # Standalone (null-bounded) "frida" = the prgname GLib feeds into "pool-%s",
     # which is why a `pool-frida` worker thread appears in the target even though
     # the literal "pool-frida" is never in the binary. Null-bounding keeps this
@@ -155,6 +195,7 @@ PATTERNS = [
     (b"frida/runtime/", "signature", False, "JS runtime sourcemap paths in the agent"),
     (b"frida-gum", "signature", False, "gum sourcemap paths in the agent"),
     (b"GumScript", "signature", False, "gum script identity"),
+    (b"GumInterceptor", "signature", False, "gum interceptor identity (in-memory marker)"),
 
     (b"frida:rpc", "rpc", True, "RPC message tag - client and agent must agree"),
 
@@ -551,7 +592,7 @@ def main() -> int:
     ap.add_argument("-n", "--name", default="sysmon",
                     help="filename to push as on-device (default: sysmon)")
     ap.add_argument("-p", "--port", type=int,
-                    help="control port, 10000-65535 (default: random)")
+                    help="control port, 10000-65534 (default: random)")
     ap.add_argument("-s", "--seed", type=int,
                     help="RNG seed, for a reproducible build")
     ap.add_argument("--patch-port", action="store_true",
@@ -644,6 +685,10 @@ def main() -> int:
         print("[!] port must be 10000-65534 (5 digits, so the ASCII literal stays "
               "the same length)", file=sys.stderr)
         return 1
+    if port in (DEFAULT_CONTROL_PORT, DEFAULT_CLUSTER_PORT):
+        print("[!] --port %d is a Frida default; the default-port probe will "
+              "still fire and --patch-port is a no-op. Pick a non-default port "
+              "unless you meant to keep the default." % port)
 
     # ---- select tiers ----------------------------------------------------
     tiers = {"safe"}
@@ -866,21 +911,17 @@ def main() -> int:
 
   # NOTE: -U / frida-ps -U will NOT see this server. USB mode probes the
   # default port only - always use -H 127.0.0.1:%d.
-
-  Still uncovered by this patch (needs a Frida-side hook): %s
-  Run --list-detections for the full catalog.
 """ % (port, port + 1,
        args.name, devpath,
        outpath, devpath,
        devpath,
-       "port is now compiled in; -l is redundant but harmless" if port_patched
-       else "the -l flag is what moves the port",
+       "port compiled in - no -l needed (fallback: -l 127.0.0.1:%d)" % port
+       if port_patched else "the -l flag is what moves the port",
        devpath, "" if port_patched else " -l 127.0.0.1:%d" % port,
        port, port,
        port,
        port, args.package,
-       port,
-       ", ".join(d["id"] for d in DETECTIONS if d["fix"] == "runtime")))
+       port))
     return 0
 
 
