@@ -74,6 +74,9 @@ Why these:
 | `--patch-rpc` | **hangs `-f` spawn** unless you also patch the host `frida/core.py` to the same tag (see the ⚠️ note under *Patch tiers*). |
 | `--aggressive` | rewrites bare `frida` → breaks `frida.Error.*` and the Frida JS global your scripts call. |
 
+> `--patch-agent-symbol` was **removed** — renaming the agent's exported symbol
+> can't be done by binary patching (needs a source rebuild). See the note under
+> *Patch tiers*.
 
 If a target still detects Frida after this, it's using a **runtime/behavioural**
 check (anon exec pages, D-Bus port-sweep, ptrace, inline-hook/CRC) — those need a
@@ -102,8 +105,8 @@ patching. Uses only the Python standard library (`urllib`) — no extra installs
 
 | Flag | Tier | Rewrites | Risk |
 |------|------|----------|------|
-| *(default)* | `safe` | `re.frida.server`, `frida-agent`, `frida-helper`, thread names (`gmain`, `gdbus`, `gum-js-loop`, `pool-frida`, `pool-spawner`), `linjector`, `LIBFRIDA`/`libfrida` | none — cosmetic or consistently-renamed paths |
-| `--patch-signatures` | `signature` | `FridaScriptEngine`, `GumScript`, `frida/runtime/`, `frida-gum` (in-memory scan markers, agent-side) | none — never crosses the wire |
+| *(default)* | `safe` | `re.frida.server`, `frida-agent`, `frida-helper`, thread names (`gmain`, `gdbus`, `gum-js-loop`, `pool-frida`, `pool-spawner`, `frida-main-loop`, `frida-eternal-agent`, `frida-generate-certificate`), `linjector`, `LIBFRIDA`/`libfrida` | none — cosmetic or consistently-renamed paths |
+| `--patch-signatures` | `signature` | `FridaScriptEngine`, `GumScript`, `GumInterceptor`, `frida/runtime/`, `frida-gum` (in-memory scan markers, agent-side) | none — never crosses the wire |
 | `--patch-rpc` | `rpc` | `frida:rpc` | **hangs spawn** unless the host client is patched too — see below |
 | `--aggressive` | all + `frida` | bare `frida` leftovers | **expect breakage** — hits `frida.Error.*` and the JS global |
 
@@ -124,10 +127,14 @@ patching. Uses only the Python standard library (`urllib`) — no extra installs
 > **leave `--patch-rpc` off.** If a target truly memory-scans for `frida:rpc`,
 > defeat it with a runtime hook that filters the memory read instead.
 
-> The agent's exported symbol `frida_agent_main` (and `gum_*`) is **not**
-> renameable by binary patching — doing so needs the agent's GNU hash table
-> rebuilt, which only a source rebuild (strongR-frida-server) can do. To beat
-> `module-export-scan`, use strongR-frida or hook `dl_iterate_phdr` at runtime.
+> The agent's exported symbol `frida_agent_main` (and `gum_*`), plus its
+> `DT_SONAME` `libfrida-agent-raw.so`, are **not** renameable by binary patching
+> — they live in the agent's protected dynamic tables, so changing them needs the
+> GNU hash rebuilt, which only a source rebuild can do. To beat
+> `module-export-scan`, use a from-source anti-detection build
+> ([strongR-frida-server](https://github.com/hzzheyang/strongR-frida-server) or
+> [phantom-frida](https://github.com/TheQmaks/phantom-frida)), or hook the app's
+> `dl_iterate_phdr` / `dlopen` enumeration at runtime.
 
 > The default `safe` tier also renames the bare `frida` **prgname**. GLib formats
 > it into `pool-%s`, so a `pool-frida` worker thread shows up in the *target* even
@@ -228,3 +235,36 @@ frida -H 127.0.0.1:<PORT> -f com.example.app -l bypass.js --no-pause
 
 > `-U` / `frida-ps -U` will **not** see this server — always connect with
 > `-H 127.0.0.1:<PORT>`.
+
+## Changelog
+
+### 2026-08-11 (detection coverage)
+
+- **New thread-name literals rewritten in the `safe` tier**: `frida-main-loop`,
+  `frida-eternal-agent`, `frida-generate-certificate`. These are real 16.x
+  thread/GSource names that a `/proc/self/task/*/comm` scan (or in-memory scan)
+  still catches after the old patch — the long ones truncate to `frida-eternal-a`
+  / `frida-generate-` in `comm` but still start with `frida`. Closes a gap in the
+  already-"covered" `thread-name-scan` vector.
+- **`GumInterceptor` added to `--patch-signatures`** alongside `GumScript` — an
+  in-memory Gum marker that never crosses the wire.
+- **`--list-detections` catalog expanded** with four runtime/behavioural vectors
+  that binary patching can't fix (documented with the right Frida-side mitigation):
+  `code-integrity-crc`, `exec-page-perms`, `named-pipe-fd-scan`, `timing-hook-check`.
+- **`module-export-scan` note updated** to include the `libfrida-agent-raw.so`
+  `DT_SONAME` and point at source-rebuild servers (strongR-frida / phantom-frida).
+
+### 2026-08-11
+
+- **`--patch-port` no longer prints a redundant `-l`.** When the default port is
+  compiled into the binary the start command is just `<name> -D`; an inline
+  fallback (`-l 127.0.0.1:<port>`) is shown in case a build encodes the default
+  in a form the opcode-anchored rewrite doesn't catch. Without `--patch-port`,
+  `-l 127.0.0.1:<port>` is still printed as the authoritative way to move the
+  listener.
+- **Warn when `-p/--port` is a Frida default (`27042`/`27043`)** — that made
+  `--patch-port` a silent no-op and left the default-port probe firing.
+- **`-p/--port` help text corrected to `10000-65534`** (was `10000-65535`; the
+  upper bound is 65534 so the ASCII literal stays 5 digits).
+- Dropped the trailing "Still uncovered … / Run `--list-detections`" footer from
+  the driving-commands output. The catalog still prints via `--list-detections`.
