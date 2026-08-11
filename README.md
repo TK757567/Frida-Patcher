@@ -235,36 +235,3 @@ frida -H 127.0.0.1:<PORT> -f com.example.app -l bypass.js --no-pause
 
 > `-U` / `frida-ps -U` will **not** see this server — always connect with
 > `-H 127.0.0.1:<PORT>`.
-
-## Changelog
-
-### 2026-08-11 (detection coverage)
-
-- **New thread-name literals rewritten in the `safe` tier**: `frida-main-loop`,
-  `frida-eternal-agent`, `frida-generate-certificate`. These are real 16.x
-  thread/GSource names that a `/proc/self/task/*/comm` scan (or in-memory scan)
-  still catches after the old patch — the long ones truncate to `frida-eternal-a`
-  / `frida-generate-` in `comm` but still start with `frida`. Closes a gap in the
-  already-"covered" `thread-name-scan` vector.
-- **`GumInterceptor` added to `--patch-signatures`** alongside `GumScript` — an
-  in-memory Gum marker that never crosses the wire.
-- **`--list-detections` catalog expanded** with four runtime/behavioural vectors
-  that binary patching can't fix (documented with the right Frida-side mitigation):
-  `code-integrity-crc`, `exec-page-perms`, `named-pipe-fd-scan`, `timing-hook-check`.
-- **`module-export-scan` note updated** to include the `libfrida-agent-raw.so`
-  `DT_SONAME` and point at source-rebuild servers (strongR-frida / phantom-frida).
-
-### 2026-08-11
-
-- **`--patch-port` no longer prints a redundant `-l`.** When the default port is
-  compiled into the binary the start command is just `<name> -D`; an inline
-  fallback (`-l 127.0.0.1:<port>`) is shown in case a build encodes the default
-  in a form the opcode-anchored rewrite doesn't catch. Without `--patch-port`,
-  `-l 127.0.0.1:<port>` is still printed as the authoritative way to move the
-  listener.
-- **Warn when `-p/--port` is a Frida default (`27042`/`27043`)** — that made
-  `--patch-port` a silent no-op and left the default-port probe firing.
-- **`-p/--port` help text corrected to `10000-65534`** (was `10000-65535`; the
-  upper bound is 65534 so the ASCII literal stays 5 digits).
-- Dropped the trailing "Still uncovered … / Run `--list-detections`" footer from
-  the driving-commands output. The catalog still prints via `--list-detections`.
