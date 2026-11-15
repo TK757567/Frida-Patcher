@@ -1,0 +1,29 @@
+# --- frida-server binaries & patched outputs (large, 15-113 MB — never commit) ---
+# GitHub hard-rejects files >100 MB; these are downloadable/reproducible anyway.
+*.xz
+frida-server-*
+sysmon
+sysmon-*
+*-patched
+*.so
+# Patched outputs saved under a custom -o/-n name won't match the globs above.
+# Add each one here (a patched frida-server is ~100+ MB and will break the push).
+tk757567
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- scratch / not part of the tool ---
+PR_DESCRIPTION.txt
+LINKEDIN_POST.txt
+
+# --- editor / OS ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

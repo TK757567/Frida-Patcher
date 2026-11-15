@@ -28,6 +28,7 @@ import hashlib
 import lzma
 import os
 import random
+import shlex
 import shutil
 import string
 import struct
@@ -150,8 +151,8 @@ DETECTIONS = [
     dict(id="java-layer-gates", fix="runtime",
          what="RootBeer, jail-monkey, DexGuard, SafetyNet/Play Integrity",
          how="Java-side checks that gate the app before any native probe",
-         note="Pure Frida-script territory - see healthmate_bypass.js for the "
-              "jail-monkey -> RootBeer -> libtoolChecker.so chain."),
+         note="Pure Frida-script territory - chain the Java-side hooks at "
+              "runtime (jail-monkey -> RootBeer -> any native libtoolChecker.so)."),
 ]
 
 # --------------------------------------------------------------------------
@@ -180,8 +181,8 @@ PATTERNS = [
     (b"linjector", "safe", True, "injector unix socket / helper name"),
     (b"LIBFRIDA", "safe", False, "in-memory marker string"),
     (b"libfrida", "safe", False, "in-memory marker string (lowercase variant)"),
-    (b"gmain", "safe", False, "glib main-loop thread name"),
-    (b"gdbus", "safe", False, "glib dbus thread name"),
+    (b"gmain\x00", "safe", False, "glib main-loop thread name (null-bounded)"),
+    (b"gdbus\x00", "safe", False, "glib dbus thread name (null-bounded)"),
     (b"frida-main-loop", "safe", False, "thread/GSource name (main loop)"),
     (b"frida-eternal-agent", "safe", False, "thread name (eternal agent) -> comm 'frida-eternal-a'"),
     (b"frida-generate-certificate", "safe", False, "thread name (TLS cert-gen) -> comm 'frida-generate-'"),
@@ -202,6 +203,26 @@ PATTERNS = [
     (b"frida", "aggressive", False, "bare leftovers: symbol names, frida.Error.* "
                                     "wire strings, the Frida JS global"),
 ]
+
+# Which fingerprint tokens each binary-fixable detection actually depends on.
+# Drives the coverage report: a vector is only "covered" when every indicator
+# token present in THIS build was patched; one left intact downgrades it to
+# "partial" and names the flag that would finish it. Tokens must match PATTERNS
+# byte-for-byte (including the null boundaries on gmain/gdbus/frida).
+DETECTION_TOKENS = {
+    "proc-maps-scan":        [b"frida-agent", b"re.frida.server", b"linjector"],
+    "thread-name-scan":      [b"gmain\x00", b"gdbus\x00", b"gum-js-loop",
+                              b"pool-spawner", b"\x00frida\x00", b"frida-main-loop",
+                              b"frida-eternal-agent", b"frida-generate-certificate"],
+    "process-scan":          [b"frida-server", b"frida-helper", b"frida-inject",
+                              b"linjector"],
+    "file-artifact-scan":    [b"re.frida.server", b"frida-agent"],
+    "unix-socket-scan":      [b"linjector"],
+    "memory-signature-scan": [b"LIBFRIDA", b"libfrida", b"FridaScriptEngine",
+                              b"GumScript", b"GumInterceptor", b"frida-gum",
+                              b"frida/runtime/"],
+}
+DETECTION_SCAN_TOKENS = {t for toks in DETECTION_TOKENS.values() for t in toks}
 
 E_MACHINE = {0x03: "x86", 0x28: "arm", 0x3E: "x86_64", 0xB7: "arm64"}
 
@@ -329,11 +350,40 @@ def iter_elf_sections(data: bytes, base: int):
         return []
 
 
+def _elf_header_sane(data: bytes, o: int) -> bool:
+    """Reject a coincidental `\\x7fELF` whose program/section header tables fall
+    outside the file. Without this, a stray magic inside agent data could parse
+    as an 'embedded ELF' and manufacture a bogus oversized protected hole (which
+    could then expose a real agent's symbol/hash tables and break spawn)."""
+    try:
+        is64 = data[o + 4] == 2
+        e = "<" if data[o + 5] == 1 else ">"
+        if is64:
+            phoff = struct.unpack_from(e + "Q", data, o + 0x20)[0]
+            shoff = struct.unpack_from(e + "Q", data, o + 0x28)[0]
+            phentsize, phnum = struct.unpack_from(e + "HH", data, o + 0x36)
+            shentsize, shnum = struct.unpack_from(e + "HH", data, o + 0x3A)
+        else:
+            phoff = struct.unpack_from(e + "I", data, o + 0x1C)[0]
+            shoff = struct.unpack_from(e + "I", data, o + 0x20)[0]
+            phentsize, phnum = struct.unpack_from(e + "HH", data, o + 0x2A)
+            shentsize, shnum = struct.unpack_from(e + "HH", data, o + 0x2E)
+        n = len(data)
+        if shoff and o + shoff + shnum * shentsize > n:
+            return False
+        if phoff and o + phoff + phnum * phentsize > n:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def find_embedded_elf_bases(data: bytes):
     """Every real ELF header in the file: offset 0 plus each embedded agent /
     helper. A bare `\\x7fELF` byte run is not enough - we also require a valid
-    class, data-encoding and a known e_machine, so a coincidental magic inside
-    some blob does not manufacture a bogus (and over-broad) protected range."""
+    class, data-encoding, a known e_machine, and in-bounds header tables, so a
+    coincidental magic inside some blob does not manufacture a bogus (and
+    over-broad) protected range."""
     bases = [0]
     o = data.find(b"\x7fELF", 1)
     while o >= 0:
@@ -341,7 +391,8 @@ def find_embedded_elf_bases(data: bytes):
             if (data[o + 4] in (1, 2) and data[o + 5] in (1, 2)
                     and struct.unpack_from(
                         ("<" if data[o + 5] == 1 else ">") + "H", data, o + 0x12
-                    )[0] in E_MACHINE):
+                    )[0] in E_MACHINE
+                    and _elf_header_sane(data, o)):
                 bases.append(o)
         except Exception:
             pass
@@ -423,6 +474,60 @@ def overlaps_protected(ranges, starts, off: int, length: int) -> bool:
     return False
 
 
+def elf_on_file_extent(data: bytes, base: int):
+    """(base, end) covering the entire on-file image of the ELF at `base`:
+    header + program headers + sections + section-header table. None if it does
+    not parse cleanly. Used to fence the port-immediate rewrite out of the
+    embedded agents, whose code lives inside the main binary's .text."""
+    try:
+        if data[base:base + 4] != b"\x7fELF":
+            return None
+        is64 = data[base + 4] == 2
+        e = "<" if data[base + 5] == 1 else ">"
+        end = base + (64 if is64 else 52)
+        if is64:
+            phoff = struct.unpack_from(e + "Q", data, base + 0x20)[0]
+            shoff = struct.unpack_from(e + "Q", data, base + 0x28)[0]
+            phentsize, phnum = struct.unpack_from(e + "HH", data, base + 0x36)
+            shentsize, shnum = struct.unpack_from(e + "HH", data, base + 0x3A)
+            W, p_off_o, p_fsz_o = e + "Q", 0x08, 0x20
+        else:
+            phoff = struct.unpack_from(e + "I", data, base + 0x1C)[0]
+            shoff = struct.unpack_from(e + "I", data, base + 0x20)[0]
+            phentsize, phnum = struct.unpack_from(e + "HH", data, base + 0x2A)
+            shentsize, shnum = struct.unpack_from(e + "HH", data, base + 0x2E)
+            W, p_off_o, p_fsz_o = e + "I", 0x04, 0x10
+        if phoff and phnum:
+            end = max(end, base + phoff + phnum * phentsize)
+            for k in range(phnum):
+                ph = base + phoff + k * phentsize
+                p_off = struct.unpack_from(W, data, ph + p_off_o)[0]
+                p_fsz = struct.unpack_from(W, data, ph + p_fsz_o)[0]
+                end = max(end, base + p_off + p_fsz)
+        if shoff and shnum:
+            end = max(end, base + shoff + shnum * shentsize)
+        for _nm, _styp, _fl, off, size in iter_elf_sections(data, base):
+            end = max(end, off + size)
+        return (base, min(end, len(data)))
+    except Exception:
+        return None
+
+
+def agent_extents(data: bytes):
+    """Merged on-file ranges of every EMBEDDED ELF (per-arch agents/helpers),
+    excluding the main binary at offset 0. The port-immediate rewrite subtracts
+    these, so an agent's own code can never be mistaken for a port constant and
+    corrupted (which would break spawn)."""
+    ext = []
+    for b in find_embedded_elf_bases(data):
+        if b == 0:
+            continue
+        r = elf_on_file_extent(data, b)
+        if r:
+            ext.append(r)
+    return _merge(ext)
+
+
 # --------------------------------------------------------------------------
 # Replacement generation - preserve length AND character class, so identifiers
 # stay identifiers, filenames stay filenames, and separators survive.
@@ -484,10 +589,23 @@ def port_encodings(arch: str, imm: int):
                 out.append((struct.pack("<I", base | (imm << 5) | rd), 4,
                             "%s%d" % (tag, rd), 0, 4))
     elif arch == "arm":
-        # movw rd, #imm : imm split across the encoding; rewrite whole insn.
+        # 32-bit ARM. Android armeabi-v7a is normally built Thumb-2, but some
+        # objects are ARM (A32), so emit BOTH encodings of the 16-bit MOVW.
+        # A32 MOVW rd,#imm : cond=AL, whole 4-byte insn, 4-byte aligned.
         for rd in range(15):
             insn = 0xE3000000 | ((imm & 0xF000) << 4) | (rd << 12) | (imm & 0xFFF)
-            out.append((struct.pack("<I", insn), 4, "movw r%d" % rd, 0, 4))
+            out.append((struct.pack("<I", insn), 4, "movw(a32) r%d" % rd, 0, 4))
+        # Thumb-2 MOVW rd,#imm (T3) : two little-endian halfwords, 2-byte aligned.
+        #   imm16 = imm4:i:imm3:imm8 ; hw1 = 11110 i 100100 imm4 ; hw2 = 0 imm3 Rd imm8
+        i_bit = (imm >> 11) & 1
+        imm4 = (imm >> 12) & 0xF
+        imm3 = (imm >> 8) & 0x7
+        imm8 = imm & 0xFF
+        hw1 = 0xF240 | (i_bit << 10) | imm4
+        for rd in range(13):            # r0-r12 ; MOVW never targets SP/PC
+            hw2 = (imm3 << 12) | (rd << 8) | imm8
+            out.append((struct.pack("<HH", hw1, hw2), 2,
+                        "movw(t2) r%d" % rd, 0, 4))
     elif arch in ("x86", "x86_64"):
         # mov r32, imm32  ==  (B8+rd) imm32 : anchor on opcode, rewrite the imm.
         regs = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
@@ -674,11 +792,16 @@ def main() -> int:
     print("    .text   : %s" % text_desc)
 
     # ---- port ------------------------------------------------------------
-    rng = random.Random(args.seed if args.seed is not None else os.urandom(16))
+    seed_val = args.seed if args.seed is not None else os.urandom(16)
+    rng = random.Random(seed_val)                 # drives string replacements
+    # Separate, deterministically-derived stream for the port, so that whether
+    # -p is given never shifts the string replacements (reproducible builds).
+    port_seed = hashlib.sha256(repr(seed_val).encode() + b"|port").digest()
+    port_rng = random.Random(port_seed)
     if args.port is None:
-        port = rng.randint(10000, 65535)
-        while port in (DEFAULT_CONTROL_PORT, DEFAULT_CLUSTER_PORT, 65535):
-            port = rng.randint(10000, 65535)
+        port = port_rng.randint(10000, 65534)
+        while port in (DEFAULT_CONTROL_PORT, DEFAULT_CLUSTER_PORT):
+            port = port_rng.randint(10000, 65534)
     else:
         port = args.port
     if not 10000 <= port <= 65534:
@@ -717,15 +840,26 @@ def main() -> int:
           "binary + %d embedded agent(s); string hits there are skipped."
           % (len(prot), n_agents))
 
+    # ---- detection-token presence (for an honest coverage report) --------
+    # Scan the ORIGINAL bytes for every token any detection depends on, whether
+    # or not its tier is enabled this run, so the coverage report can tell
+    # "already clean / not in this build" from "needs another flag". Hits inside
+    # a protected region don't count - they are never rewritten.
+    found_tokens = set()
+    for t in DETECTION_SCAN_TOKENS:
+        if any(not overlaps_protected(prot, prot_starts, h, len(t))
+               for h in find_all(data, t)):
+            found_tokens.add(t)
+
     # ---- scan + patch strings -------------------------------------------
     print("\n[*] string indicators")
     print("    %-18s %-18s %5s %5s  %s"
           % ("token", "replacement", "hits", "skip", "role"))
     total = 0
     total_skipped = 0
-    covered_tiers = set()
+    patched_tokens = set()
     for token, tier, functional, desc in selected:
-        all_hits = find_all(bytes(buf), token)
+        all_hits = find_all(buf, token)
         hits = [h for h in all_hits
                 if not overlaps_protected(prot, prot_starts, h, len(token))]
         skipped = len(all_hits) - len(hits)
@@ -738,10 +872,14 @@ def main() -> int:
         for off in hits:
             buf[off:off + len(token)] = repl
         total += len(hits)
-        covered_tiers.add(tier)
+        patched_tokens.add(token)
         mark = "*" if functional else " "
         print("    %-18s %-18s %5d %5d %s %s"
               % (disp(token), disp(repl), len(hits), skipped, mark, desc))
+        if functional and skipped:
+            print("    %-18s   ^ %d occurrence(s) left inside a protected agent/"
+                  "symbol region; the runtime path resolves from the patched "
+                  "copies, so spawn stays intact." % ("", skipped))
     print("    (* = functionally resolved at runtime; every occurrence gets the "
           "same replacement)")
     if total_skipped:
@@ -753,53 +891,96 @@ def main() -> int:
               "it is packed/compressed and the strings are not literal.")
 
     # ---- port patching ---------------------------------------------------
-    port_patched = 0
+    # Counters kept separate on purpose: only a rewritten CONTROL-port
+    # instruction immediate actually moves the port the server binds to, so only
+    # that (and only for a NON-default port) may drop the -l flag later. ASCII
+    # (help text) and cluster-port hits must never make the tool claim the port
+    # is "compiled in".
+    ascii_patched = ctrl_imm_patched = clus_imm_patched = 0
     if args.patch_port:
         print("\n[*] default-port rewrite  %d -> %d" % (DEFAULT_CONTROL_PORT, port))
         scan_lo, scan_hi = (elf.text if elf.text else (0, len(buf)))
-        region = bytes(buf[scan_lo:scan_hi])
-
-        for old_val, new_val, label in ((DEFAULT_CONTROL_PORT, port, "control"),
-                                        (DEFAULT_CLUSTER_PORT, port + 1, "cluster")):
-            # ASCII literal (both are 5 digits, so length is preserved).
-            # Require the digits to stand alone, so we never corrupt a longer
-            # number that merely contains them.
+        # The file's .text also contains the embedded per-arch agents; an
+        # opcode+immediate pattern can collide with an unrelated constant in
+        # agent code, and overwriting that corrupts the agent (spawn dies). So
+        # scan main-server code only: .text minus every embedded agent's extent.
+        code_segments = _subtract([(scan_lo, scan_hi)], agent_extents(data))
+        # Snapshot the search space ONCE, before any write: the control and the
+        # cluster pass must both see the ORIGINAL bytes, never each other's
+        # edits. (Otherwise -p 27043 would make the cluster pass re-find and
+        # clobber the control sites the control pass just wrote.) So plan every
+        # site first, against the pre-write bytes, then apply.
+        segs = [(lo, bytes(buf[lo:hi])) for lo, hi in code_segments]
+        ascii_sites = []   # (off, new5, label)
+        imm_sites = []     # (insn_off, poff, new_bytes, tag, label, is_ctrl)
+        for old_val, new_val, label, is_ctrl in (
+                (DEFAULT_CONTROL_PORT, port, "control", True),
+                (DEFAULT_CLUSTER_PORT, port + 1, "cluster", False)):
+            if old_val == new_val:
+                continue   # requested port already equals this default - no-op
+            # ASCII literal (help/usage text) - cosmetic, never the bind port.
+            # Length-preserving (5 digits), stand-alone digits, skip protected.
             asc_old, asc_new = str(old_val).encode(), str(new_val).encode()
-            for off in find_all(bytes(buf), asc_old):
+            for off in find_all(buf, asc_old):
+                if overlaps_protected(prot, prot_starts, off, 5):
+                    continue
                 before = buf[off - 1:off]
                 after = buf[off + 5:off + 6]
                 if (before and before.isdigit()) or (after and after.isdigit()):
                     continue
-                buf[off:off + 5] = asc_new
-                port_patched += 1
-                print("    ascii   0x%08x  %s" % (off, label))
+                ascii_sites.append((off, asc_new, label))
 
-            # instruction immediates, .text only. Patterns are opcode-anchored
-            # per arch (see port_encodings), so a data word or an unrelated
-            # instruction that merely contains `imm` is never overwritten.
+            # Instruction immediates, MAIN-SERVER code only, opcode-anchored per
+            # arch (see port_encodings), so a data word or an unrelated insn that
+            # merely contains `imm` is never overwritten.
             olds = port_encodings(elf.arch, old_val)
             news = port_encodings(elf.arch, new_val)
             sites = []
             for (opat, align, tag, poff, plen), (npat, *_) in zip(olds, news):
-                for off in find_all(region, opat, align):
-                    sites.append((scan_lo + off, poff, npat[poff:poff + plen], tag))
+                for seg_lo, seg in segs:
+                    for off in find_all(seg, opat):
+                        abs_off = seg_lo + off
+                        if abs_off % align == 0:
+                            sites.append((abs_off, poff,
+                                          npat[poff:poff + plen], tag))
             if len(sites) > args.max_port_sites and not args.force:
                 print("    [!] %d immediate sites for %d - above --max-port-sites "
                       "(%d); skipped. Re-run with --force to patch anyway, or "
                       "just use the -l flag."
                       % (len(sites), old_val, args.max_port_sites))
                 continue
-            for base_off, poff, wbytes, tag in sites:
-                buf[base_off + poff:base_off + poff + len(wbytes)] = wbytes
-                port_patched += 1
-                print("    %-9s 0x%08x  %s" % (tag, base_off, label))
+            for insn_off, poff, wbytes, tag in sites:
+                imm_sites.append((insn_off, poff, wbytes, tag, label, is_ctrl))
 
-        if port_patched == 0:
+        # Apply (every site was located against the pre-write snapshot).
+        for off, new5, label in ascii_sites:
+            buf[off:off + 5] = new5
+            ascii_patched += 1
+            print("    ascii     0x%08x  %s (cosmetic)" % (off, label))
+        for insn_off, poff, wbytes, tag, label, is_ctrl in imm_sites:
+            buf[insn_off + poff:insn_off + poff + len(wbytes)] = wbytes
+            if is_ctrl:
+                ctrl_imm_patched += 1
+            else:
+                clus_imm_patched += 1
+            print("    %-9s 0x%08x  %s" % (tag, insn_off, label))
+
+        if ascii_patched + ctrl_imm_patched + clus_imm_patched == 0:
             print("    no default-port sites found - the -l flag below is the "
                   "authoritative way to move the port.")
+        elif ctrl_imm_patched == 0:
+            print("    [!] no CONTROL-port instruction immediate was rewritten "
+                  "(%d ascii / %d cluster hit(s) only); the compiled-in bind "
+                  "port is UNCHANGED - you must still pass -l 127.0.0.1:%d."
+                  % (ascii_patched, clus_imm_patched, port))
     else:
         print("\n[*] default port left at %d in the binary; the -l flag below "
               "moves the listener to %d." % (DEFAULT_CONTROL_PORT, port))
+
+    # Dropping -l is justified only by a real control-port immediate rewrite to a
+    # NON-default port (a default port can't beat the default-port probe anyway).
+    port_compiled_in = (ctrl_imm_patched > 0
+                        and port not in (DEFAULT_CONTROL_PORT, DEFAULT_CLUSTER_PORT))
 
     # ---- verify ----------------------------------------------------------
     out = bytes(buf)
@@ -841,31 +1022,46 @@ def main() -> int:
             print("    residual %-6s          x%d%s" % (probe.decode(), n, note))
 
     # ---- coverage --------------------------------------------------------
-    tier_for = {
-        "default-port-probe": None,          # always handled, via -l or --patch-port
-        "proc-maps-scan": "safe",
-        "thread-name-scan": "safe",
-        "process-scan": "safe",
-        "file-artifact-scan": "safe",
-        "unix-socket-scan": "safe",
-        "memory-signature-scan": "signature",
-    }
+    # A binary vector is "covered" only when every one of its indicator tokens
+    # that is actually present in THIS build was patched. A token present but
+    # left intact (its tier wasn't enabled, or it was --kept) downgrades the
+    # vector to "partial" and names the flag that would finish it.
+    tier_flag = {"signature": "--patch-signatures", "rpc": "--patch-rpc",
+                 "aggressive": "--aggressive"}
+    token_tier = {p[0]: p[1] for p in PATTERNS}
     print("\n[*] detection coverage")
     for d in DETECTIONS:
+        did = d["id"]
         if d["fix"] == "runtime":
-            state = "NOT COVERED  needs a Frida-side hook"
+            print("    %-22s NOT COVERED  needs a Frida-side hook" % did)
+            continue
+        if did == "default-port-probe":
+            state = ("covered (control port compiled in)" if port_compiled_in
+                     else "covered via the -l flag (enable --patch-port to "
+                          "compile it in)")
+            print("    %-22s %s" % (did, state))
+            continue
+        present = [t for t in DETECTION_TOKENS.get(did, []) if t in found_tokens]
+        if not present:
+            state = "no matching indicators in this build"
         else:
-            need = tier_for.get(d["id"])
-            if need is None or need in covered_tiers:
+            missing = [t for t in present if t not in patched_tokens]
+            if not missing:
                 state = "covered"
             else:
-                flag = {"signature": "--patch-signatures"}[need]
-                state = "not covered   enable %s" % flag
-        print("    %-22s %s" % (d["id"], state))
+                flags = sorted({tier_flag[token_tier[t]] for t in missing
+                                if token_tier.get(t) in tier_flag})
+                done = len(present) - len(missing)
+                state = ("partial (%d/%d) - enable %s"
+                         % (done, len(present), ", ".join(flags)) if flags
+                         else "partial (%d/%d) - --kept token(s) remain"
+                         % (done, len(present)))
+        print("    %-22s %s" % (did, state))
 
     if args.check:
-        print("\n[*] --check: nothing written.")
-        return 0
+        print("\n[*] --check: nothing written (%s)."
+              % ("verification OK" if ok else "VERIFICATION FAILED"))
+        return 0 if ok else 1
     if not ok:
         print("\n[!] verification failed - not writing output.", file=sys.stderr)
         return 1
@@ -881,8 +1077,9 @@ def main() -> int:
     devpath = "/data/local/tmp/%s" % args.name
     if args.push:
         print("\n[*] pushing to %s" % devpath)
+        chmod = "chmod 755 %s" % shlex.quote(devpath)
         for cmd in (["adb", "push", outpath, devpath],
-                    ["adb", "shell", "su -c 'chmod 755 %s'" % devpath]):
+                    ["adb", "shell", "su", "-c", chmod]):
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 print("    [!] %s\n        %s" % (" ".join(cmd), r.stderr.strip()))
@@ -916,8 +1113,8 @@ def main() -> int:
        outpath, devpath,
        devpath,
        "port compiled in - no -l needed (fallback: -l 127.0.0.1:%d)" % port
-       if port_patched else "the -l flag is what moves the port",
-       devpath, "" if port_patched else " -l 127.0.0.1:%d" % port,
+       if port_compiled_in else "the -l flag is what moves the port",
+       devpath, "" if port_compiled_in else " -l 127.0.0.1:%d" % port,
        port, port,
        port,
        port, args.package,

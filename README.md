@@ -199,7 +199,8 @@ The port rewrite is **opcode-anchored per architecture**, detected from the ELF
 header (`arm64` / `arm` / `x86` / `x86_64`):
 
 - **ARM64** — matches the specific `movz`/`movk w|x` opcode at 4-byte alignment.
-- **ARM** — matches the `movw rd` encoding.
+- **ARM** — matches both the **Thumb-2 `MOVW`** (T3 encoding, the usual
+  armeabi-v7a build) and the A32 `MOVW rd` encoding.
 - **x86 / x86_64** — matches `mov r32, imm32` (`B8+rd`, incl. `REX.B` for
   `r8d–r15d`) and rewrites **only the 4 immediate bytes**, keeping the opcode.
 
@@ -209,9 +210,19 @@ whose displacement happens to be `0x69a2`. (A naive bare-value scan on x86 would
 corrupt exactly those, breaking call targets.) Anything on an unrecognised arch
 skips immediate patching entirely and relies on the runtime `-l` flag.
 
+The immediate scan runs over the **main server's own code only** — every
+embedded per-arch agent is carved out of the range first, so a port-valued
+constant *inside an agent* can never be mistaken for the listener port and
+corrupted (which would break spawn). The tool drops the `-l` flag from the start
+command **only when it actually rewrote a control-port immediate**; if it finds
+just the ASCII/help copy of the port (or nothing on that arch), it keeps `-l` so
+the server still lands on the right port.
+
 ## What it can NOT fix (needs a Frida-side hook)
 
-`port-sweep` · `anon-exec-mappings` · `tracer-pid` · `inline-hook-check` ·
+`port-sweep` · `anon-exec-mappings` · `module-export-scan` · `tracer-pid` ·
+`inline-hook-check` · `code-integrity-crc` · `exec-page-perms` ·
+`named-pipe-fd-scan` · `timing-hook-check` ·
 `java-layer-gates` (RootBeer / jail-monkey / DexGuard / Play Integrity).
 
 These are behavioral, not string-based — patching the server binary cannot help.
@@ -235,3 +246,61 @@ frida -H 127.0.0.1:<PORT> -f com.example.app -l bypass.js --no-pause
 
 > `-U` / `frida-ps -U` will **not** see this server — always connect with
 > `-H 127.0.0.1:<PORT>`.
+
+## Changelog
+
+### 2026-11-15 (correctness + ARM/agent hardening)
+
+- **`--patch-port` no longer over-promises.** The `-l` flag is dropped from the
+  start command **only when a control-port instruction immediate was actually
+  rewritten** — previously an ASCII/help-text hit (or a cluster-only hit) could
+  make the tool claim "port compiled in" while the server still bound the
+  default port. A warning now fires when only non-functional copies were found.
+- **Port immediates are scanned in main-server code only.** The embedded
+  per-arch agents are carved out of the scan range, so a port-valued constant
+  inside an agent can no longer be mis-patched and break spawn. Verified by
+  byte-diff: a full `--patch-port --patch-signatures` run changes **zero** bytes
+  in any agent's protected sections, and the only `.text` edits are the port
+  immediates (opcode preserved).
+- **ARM `--patch-port` now covers Thumb-2.** Emits both the Thumb-2 `MOVW` (T3)
+  and A32 encodings — armeabi-v7a frida-server is normally Thumb-2, which the
+  old A32-only matcher missed.
+- **`gmain` / `gdbus` thread names are null-bounded** (`gmain\0` / `gdbus\0`) so
+  they can't corrupt a longer string that merely begins with them.
+- **Honest detection-coverage report.** Each vector is scored against the
+  specific indicator tokens actually present in the build; a token left intact
+  shows `partial (n/m) - enable <flag>` instead of a blanket "covered".
+- **`--check` returns a real exit code** (non-zero when verification fails),
+  seed-reproducible builds no longer depend on whether `-p` was passed, and
+  `--push` shell-quotes the device path.
+
+### 2026-08-11 (detection coverage)
+
+- **New thread-name literals rewritten in the `safe` tier**: `frida-main-loop`,
+  `frida-eternal-agent`, `frida-generate-certificate`. These are real 16.x
+  thread/GSource names that a `/proc/self/task/*/comm` scan (or in-memory scan)
+  still catches after the old patch — the long ones truncate to `frida-eternal-a`
+  / `frida-generate-` in `comm` but still start with `frida`. Closes a gap in the
+  already-"covered" `thread-name-scan` vector.
+- **`GumInterceptor` added to `--patch-signatures`** alongside `GumScript` — an
+  in-memory Gum marker that never crosses the wire.
+- **`--list-detections` catalog expanded** with four runtime/behavioural vectors
+  that binary patching can't fix (documented with the right Frida-side mitigation):
+  `code-integrity-crc`, `exec-page-perms`, `named-pipe-fd-scan`, `timing-hook-check`.
+- **`module-export-scan` note updated** to include the `libfrida-agent-raw.so`
+  `DT_SONAME` and point at source-rebuild servers (strongR-frida / phantom-frida).
+
+### 2026-08-11
+
+- **`--patch-port` no longer prints a redundant `-l`.** When the default port is
+  compiled into the binary the start command is just `<name> -D`; an inline
+  fallback (`-l 127.0.0.1:<port>`) is shown in case a build encodes the default
+  in a form the opcode-anchored rewrite doesn't catch. Without `--patch-port`,
+  `-l 127.0.0.1:<port>` is still printed as the authoritative way to move the
+  listener.
+- **Warn when `-p/--port` is a Frida default (`27042`/`27043`)** — that made
+  `--patch-port` a silent no-op and left the default-port probe firing.
+- **`-p/--port` help text corrected to `10000-65534`** (was `10000-65535`; the
+  upper bound is 65534 so the ASCII literal stays 5 digits).
+- Dropped the trailing "Still uncovered … / Run `--list-detections`" footer from
+  the driving-commands output. The catalog still prints via `--list-detections`.

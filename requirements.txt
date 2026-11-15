@@ -1,0 +1,12 @@
+# fridapatch.py has NO third-party Python dependencies.
+# It runs on the Python 3.7+ standard library alone (argparse, lzma, struct,
+# hashlib, bisect, random, subprocess, ...), so this file is intentionally empty
+# of installable packages -- `pip install -r requirements.txt` is a no-op.
+#
+# External tools (NOT pip packages) used only for optional features:
+#   * adb          -> required by `--push` (ships with Android platform-tools)
+#   * frida-tools  -> to drive the patched server from your host:
+#                       pip install frida-tools
+#     (provides `frida` / `frida-ps`; the patcher itself never imports frida)
+#
+# Python: 3.7 or newer (uses `from __future__ import annotations`).
